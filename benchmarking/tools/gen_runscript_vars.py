@@ -14,6 +14,7 @@
 
 import argparse
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -39,15 +40,23 @@ _GB = 1024 * _MB
 _TB = 1024 * _GB
 _max_container_memory_bytes = 2 * _TB
 _shm_size_container_memory_percentage = 0.5  # 50%
+_container_config_copy_prefix = Path("/tmp/curator-benchmarking/configs")  # noqa: S108
+_setup_script_container_path = Path("/tmp/curator-benchmarking/setup_benchmark_env.sh")  # noqa: S108
+_default_config_relative_path = Path("benchmarking/nightly-benchmark.yaml")
 
-CURATOR_BENCHMARKING_IMAGE = os.environ.get("CURATOR_BENCHMARKING_IMAGE", "nemo_curator_benchmarking:latest")
+CURATOR_IMAGE = os.environ.get(
+    "CURATOR_IMAGE",
+    os.environ.get("CURATOR_BENCHMARKING_IMAGE", "nemo_curator:latest"),
+)
 GPUS = os.environ.get("GPUS", "all")
 HOST_CURATOR_DIR = os.environ.get("HOST_CURATOR_DIR", str(this_script_path.parent.parent.absolute()))
 CURATOR_BENCHMARKING_DEBUG = os.environ.get("CURATOR_BENCHMARKING_DEBUG", "0")
+CURATOR_BENCHMARK_SETUP = os.environ.get("CURATOR_BENCHMARK_SETUP", "check")
 
-BASH_ENTRYPOINT_OVERRIDE = ""
-ENTRYPOINT_ARGS = []
+CONTAINER_COMMAND = []
 VOLUME_MOUNTS = []
+CONFIG_FILE_COPY_HOSTS = []
+CONFIG_FILE_COPY_DESTS = []
 
 
 def print_help(script_name: str) -> None:
@@ -59,24 +68,54 @@ def print_help(script_name: str) -> None:
       --use-host-curator       Mount $HOST_CURATOR_DIR into the container for benchmarking/debugging curator sources without rebuilding the image.
       --use-host-curator-benchmarking
                                Like --use-host-curator, but only for the benchmarking directory. This is useful for using the host benchmarking tools to benchmark Curator installed in the container.
+      --image <image>          Docker image to use when starting a new benchmark container.
+      --container <name-or-id> Run benchmarks or a shell in an already-running container. The container must already have required mounts, GPUs, shm, and env in place.
+      --setup <mode>           Environment setup mode before running benchmarks: check, install, or skip (default: {CURATOR_BENCHMARK_SETUP}).
+                               check validates the environment without installing packages. install runs benchmark environment setup first, then check. skip trusts the environment.
       --shell                  Start an interactive bash shell instead of running benchmarks. ARGS, if specified, will be passed to 'bash -c'.
                                For example: '--shell uv pip list | grep cugraph' will run 'uv pip list | grep cugraph' to display the version of cugraph installed in the container.
-      --config <path>          Path to a YAML config file. Can be specified multiple times to merge configs. This arg is required if not using --shell.
+      --config <path>          Path to a YAML config file. Can be specified multiple times to merge configs.
+                               Defaults to $HOST_CURATOR_DIR/benchmarking/nightly-benchmark.yaml when omitted and not using --shell.
       -h, --help               Show this help message and exit.
 
-      ARGS, if specified, are passed to the container entrypoint, either the default benchmarking entrypoint or the --shell bash entrypoint.
+      ARGS, if specified, are passed to the command run inside the target environment, either the default benchmarking runner or the --shell bash command.
 
   Optional environment variables to override config and defaults:
       GPUS                          Value for --gpus option to docker run (using: {GPUS}).
-      CURATOR_BENCHMARKING_IMAGE    Docker image to use (using: {CURATOR_BENCHMARKING_IMAGE}).
+      CURATOR_IMAGE                 Docker image to use when --image is not specified (using: {CURATOR_IMAGE}).
+                                    CURATOR_BENCHMARKING_IMAGE is still accepted as a backward-compatible fallback.
       HOST_CURATOR_DIR              Curator repo path used with --use-host-curator (see above) (using: {HOST_CURATOR_DIR}).
       CURATOR_BENCHMARKING_DEBUG    Set to 1 for debug mode (regular output, possibly more in the future) (using: {CURATOR_BENCHMARKING_DEBUG}).
+      CURATOR_BENCHMARK_SETUP       Default --setup value when omitted (using: {CURATOR_BENCHMARK_SETUP}).
     """)
 
 
 def combine_dir_paths(patha: str | Path, pathb: str | Path) -> Path:
     """Combine two paths, ensuring the result is an absolute path."""
     return Path(f"{patha}/{pathb}").absolute().expanduser().resolve()
+
+
+def default_config_file() -> Path:
+    """Return the host-side default benchmark config path."""
+    return Path(HOST_CURATOR_DIR).expanduser().absolute() / _default_config_relative_path
+
+
+def container_copy_path(host_path: Path) -> Path:
+    """Return the deterministic container path used when copying host files into a running container."""
+    if not host_path.is_absolute():
+        msg = f"Path '{host_path}' must be an absolute path."
+        raise ValueError(msg)
+    return _container_config_copy_prefix / host_path.relative_to("/")
+
+
+def bash_array(values: list[str | Path]) -> str:
+    """Return a bash array literal with shell-quoted values."""
+    return "(" + " ".join(shlex.quote(str(value)) for value in values) + ")"
+
+
+def bash_assign(name: str, value: str | Path | int) -> str:
+    """Return a shell-safe scalar assignment."""
+    return f"{name}={shlex.quote(str(value))}\n"
 
 
 def get_runscript_eval_str(argv: list[str]) -> str:  # noqa: C901, PLR0912, PLR0915
@@ -90,17 +129,18 @@ def get_runscript_eval_str(argv: list[str]) -> str:  # noqa: C901, PLR0912, PLR0
     # Make a copy of argv to avoid modifying the caller's list.
     argv = argv.copy()
     # Initialize with defaults, these will be modified in this function.
-    bash_entrypoint_override = BASH_ENTRYPOINT_OVERRIDE
-    entrypoint_args = ENTRYPOINT_ARGS.copy()
+    container_command = CONTAINER_COMMAND.copy()
     volume_mounts = VOLUME_MOUNTS.copy()
+    config_file_copy_hosts = CONFIG_FILE_COPY_HOSTS.copy()
+    config_file_copy_dests = CONFIG_FILE_COPY_DESTS.copy()
 
     # This script must be called with the run.sh bash script as the first arg.
     # It will be removed before parsing the rest of the args.
     if len(argv) > 1:
         script_name = Path(argv[1]).name
         # Show help and exit if -h|--help is passed as first arg. All other options are passed to the
-        # container entrypoint including -h|--help if other args are present. This provides a way for
-        # -h|--help to be passed to the container entrypoint while still allowing for -h|--help output
+        # container command including -h|--help if other args are present. This provides a way for
+        # -h|--help to be passed to the container command while still allowing for -h|--help output
         # for the run.sh script.
         if len(argv) > 2 and argv[2] in ("-h", "--help"):  # noqa: PLR2004
             print_help(script_name)
@@ -116,57 +156,96 @@ def get_runscript_eval_str(argv: list[str]) -> str:  # noqa: C901, PLR0912, PLR0
     )
     parser.add_argument("--use-host-curator", action="store_true")
     parser.add_argument("--use-host-curator-benchmarking", action="store_true")
+    parser.add_argument("--image", default=None)
+    parser.add_argument("--container", default=None)
+    parser.add_argument("--setup", choices=("check", "install", "skip"), default=CURATOR_BENCHMARK_SETUP)
     parser.add_argument("--shell", action="store_true")
     parser.add_argument("--config", action="append", type=Path, default=[])
 
     args, unknown_args = parser.parse_known_args(argv[1:])
+    image = args.image or CURATOR_IMAGE
+    run_target = "container" if args.container else "image"
+    is_list = "--list" in unknown_args
+
+    if not args.config and not args.shell:
+        config_file = default_config_file()
+        if not config_file.is_file():
+            msg = (
+                f"Default benchmark config not found: {config_file}. "
+                "Pass --config explicitly or set HOST_CURATOR_DIR to a Curator repo containing "
+                f"{_default_config_relative_path}."
+            )
+            raise FileNotFoundError(msg)
+        args.config = [config_file]
 
     # Set volume mount for host curator or benchmarking directories.
     if args.use_host_curator and args.use_host_curator_benchmarking:
         msg = "Cannot use --use-host-curator and --use-host-curator-benchmarking together."
         raise RuntimeError(msg)
 
+    if args.container and args.image:
+        msg = "Cannot use --image with --container."
+        raise RuntimeError(msg)
+
+    if args.container and (args.use_host_curator or args.use_host_curator_benchmarking):
+        msg = "Cannot use host source mount options with --container; start the container with those mounts instead."
+        raise RuntimeError(msg)
+
     if args.use_host_curator:
         # Do not use combine_dir_paths here since CONTAINER_CURATOR_DIR is assumed to be a unique absolute
         # path (e.g., /opt/Curator from Dockerfile).
-        volume_mounts.append(f"--volume {Path(HOST_CURATOR_DIR).absolute()}:{CONTAINER_CURATOR_DIR}")
+        volume_mounts.extend(["--volume", f"{Path(HOST_CURATOR_DIR).absolute()}:{CONTAINER_CURATOR_DIR}"])
 
     if args.use_host_curator_benchmarking:
-        volume_mounts.append(
-            f"--volume {(Path(HOST_CURATOR_DIR) / 'benchmarking').absolute()}:{Path(CONTAINER_CURATOR_DIR) / 'benchmarking'}"
+        volume_mounts.extend(
+            [
+                "--volume",
+                f"{(Path(HOST_CURATOR_DIR) / 'benchmarking').absolute()}:{Path(CONTAINER_CURATOR_DIR) / 'benchmarking'}",
+            ]
         )
 
-    # Set entrypoint to bash if --shell is passed.
-    if args.shell:
-        bash_entrypoint_override = "--entrypoint=bash"
-        if len(unknown_args) > 0:
-            entrypoint_args.extend(["-c", " ".join(unknown_args)])
-    else:
-        entrypoint_args.extend(unknown_args)
+    setup_script_host_path = this_script_path / "setup_benchmark_env.sh"
+    if run_target == "image" and args.setup != "skip":
+        volume_mounts.extend(["--volume", f"{setup_script_host_path}:{_setup_script_container_path}:ro"])
 
-    # Parse config files and set volume mounts for all mapped directories
+    # Parse config files and set volume mounts for all mapped directories.
     if args.config:
         config_dict = merge_config_files(args.config)
         assert_valid_config_dict(config_dict)
-        path_resolver = PathResolver(config_dict)
 
-        # Add a volume mount for each configured path.
-        for host_path, container_path in path_resolver.volume_mount_pairs():
-            if not host_path.is_absolute():
-                msg = f"Path '{host_path}' must be an absolute path."
-                raise ValueError(msg)
-            volume_mounts.append(f"--volume {host_path}:{container_path}")
+        if run_target == "image" and not is_list:
+            path_resolver = PathResolver(config_dict)
 
-    # Add volume mounts for each config file so the script in the container can read each one
-    # and add each to ENTRYPOINT_ARGS.
+            # Add a volume mount for each configured path.
+            for host_path, container_path in path_resolver.volume_mount_pairs():
+                if not host_path.is_absolute():
+                    msg = f"Path '{host_path}' must be an absolute path."
+                    raise ValueError(msg)
+                volume_mounts.extend(["--volume", f"{host_path}:{container_path}"])
+
+    # Add volume mounts or copy plans for config files so the script in the container can read each one
+    # and add each to the benchmark runner args.
+    runner_args = unknown_args.copy()
     for config_file in args.config:
         config_file_host = config_file.absolute().expanduser().resolve()
-        container_dir_path = combine_dir_paths(DEFAULT_CONTAINER_PATH_PREFIX, config_file_host)
-        volume_mounts.append(f"--volume {config_file_host}:{container_dir_path}")
+        if run_target == "image":
+            container_dir_path = combine_dir_paths(DEFAULT_CONTAINER_PATH_PREFIX, config_file_host)
+            volume_mounts.extend(["--volume", f"{config_file_host}:{container_dir_path}"])
+        else:
+            container_dir_path = container_copy_path(config_file_host)
+            config_file_copy_hosts.append(config_file_host)
+            config_file_copy_dests.append(container_dir_path)
         # Only add modified --config args if running the benchmark tool entrypoint, not the
         # bash shell entrypoint.
         if not args.shell:
-            entrypoint_args.append(f"--config={container_dir_path}")
+            runner_args.append(f"--config={container_dir_path}")
+
+    if args.shell:
+        container_command = ["bash"]
+        if len(unknown_args) > 0:
+            container_command.extend(["-lc", " ".join(unknown_args)])
+    else:
+        container_command = ["python", f"{CONTAINER_CURATOR_DIR}/benchmarking/run.py", *runner_args]
 
     # The total available container memory will be the total host memory, but no more
     # than _max_container_memory_bytes.
@@ -176,16 +255,21 @@ def get_runscript_eval_str(argv: list[str]) -> str:  # noqa: C901, PLR0912, PLR0
 
     # Build and return the string to eval in bash.
     eval_str = ""
-    eval_str += f"BASH_ENTRYPOINT_OVERRIDE={bash_entrypoint_override}\n"
-    eval_str += f"CURATOR_BENCHMARKING_IMAGE={CURATOR_BENCHMARKING_IMAGE}\n"
-    eval_str += f"GPUS={GPUS}\n"
-    eval_str += f"CONTAINER_MEMORY_BYTES={container_memory_bytes}\n"
-    eval_str += f"SHM_SIZE_BYTES={shm_size_bytes}\n"
-    eval_str += f"HOST_CURATOR_DIR={HOST_CURATOR_DIR}\n"
-    eval_str += f"CURATOR_BENCHMARKING_DEBUG={CURATOR_BENCHMARKING_DEBUG}\n"
-    vms = f'"{" ".join(volume_mounts)}"' if volume_mounts else ""
-    eval_str += f"VOLUME_MOUNTS={vms}\n"
-    eval_str += "ENTRYPOINT_ARGS=(" + " ".join([f'"{arg}"' for arg in entrypoint_args]) + ")\n"
+    eval_str += bash_assign("RUN_TARGET", run_target)
+    eval_str += bash_assign("CURATOR_IMAGE", image)
+    eval_str += bash_assign("CONTAINER_NAME", args.container or "")
+    eval_str += bash_assign("SETUP_MODE", args.setup)
+    eval_str += bash_assign("SETUP_SCRIPT_HOST_PATH", setup_script_host_path)
+    eval_str += bash_assign("SETUP_SCRIPT_CONTAINER_PATH", _setup_script_container_path)
+    eval_str += bash_assign("GPUS", GPUS)
+    eval_str += bash_assign("CONTAINER_MEMORY_BYTES", container_memory_bytes)
+    eval_str += bash_assign("SHM_SIZE_BYTES", shm_size_bytes)
+    eval_str += bash_assign("HOST_CURATOR_DIR", HOST_CURATOR_DIR)
+    eval_str += bash_assign("CURATOR_BENCHMARKING_DEBUG", CURATOR_BENCHMARKING_DEBUG)
+    eval_str += f"VOLUME_MOUNTS={bash_array(volume_mounts)}\n"
+    eval_str += f"CONFIG_FILE_COPY_HOSTS={bash_array(config_file_copy_hosts)}\n"
+    eval_str += f"CONFIG_FILE_COPY_DESTS={bash_array(config_file_copy_dests)}\n"
+    eval_str += f"CONTAINER_COMMAND={bash_array(container_command)}\n"
     return eval_str
 
 

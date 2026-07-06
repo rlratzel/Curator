@@ -368,31 +368,115 @@ entries:
 
 ## Running benchmarks and using the container
 
-The `benchmarking/tools/run.sh` script provides a convenient way to run benchmarks in a Docker container with proper volume mounts, GPU access, and environment configuration.
+The `benchmarking/tools/run.sh` script provides a convenient way to run benchmarks in a Docker container
+with proper volume mounts, GPU access, environment configuration, and optional benchmark environment checks.
 
 ### Basic Usage
 
-Run benchmarks using a configuration file:
+Run every enabled benchmark in the default nightly benchmark config:
+
+```bash
+./benchmarking/tools/run.sh
+```
+
+When `--config` is omitted, `run.sh` defaults to `$HOST_CURATOR_DIR/benchmarking/nightly-benchmark.yaml`.
+If that host-side file does not exist, `run.sh` fails and asks for an explicit `--config` or a corrected
+`HOST_CURATOR_DIR`. The host-side default is required so the wrapper can parse paths and create Docker
+mounts before starting a new container.
+
+List every enabled benchmark in the default config without running entries:
+
+```bash
+./benchmarking/tools/run.sh --list
+```
+
+List mode still validates that the config can be loaded, but it does not mount or check runtime-only
+dataset, model, results, GPU, or `/dev/shm` resources.
+
+Run benchmarks using an explicit configuration file:
 
 ```bash
 ./benchmarking/tools/run.sh --config benchmarking/my-benchmark.yaml
 ```
 
-This command:
-- Reads the configuration file and extracts `results_path` and `datasets_path`
-- Automatically creates volume mounts to map these paths into the container
-- Runs the benchmarking framework with the Curator code built into the Docker image
-- Passes environment variables like `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`, and `MLFLOW_TRACKING_URI` to the container
+These commands:
+- Use the standard Curator Docker image, `nemo_curator:latest`, unless overridden
+- Read the configuration file and extract configured paths
+- Automatically create volume mounts to map those paths into a new container
+- Run `benchmarking/tools/setup_benchmark_env.sh --mode check` before the benchmark runner
+- Run `python /opt/Curator/benchmarking/run.py` inside the target environment
+- Pass environment variables like `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`, and `MLFLOW_TRACKING_URI` to the container
+
+### Using Another Image
+
+Use `--image` to run against a specific Curator image, including images from another registry:
+
+```bash
+./benchmarking/tools/run.sh --image nvcr.io/example/curator:my-tag --config benchmarking/my-benchmark.yaml
+```
+
+The image is expected to contain Curator at `/opt/Curator`, matching the standard Curator image layout.
+
+The `CURATOR_IMAGE` environment variable changes the default image when `--image` is omitted:
+
+```bash
+CURATOR_IMAGE=nvcr.io/example/curator:my-tag ./benchmarking/tools/run.sh --config benchmarking/my-benchmark.yaml
+```
+
+For compatibility, `CURATOR_BENCHMARKING_IMAGE` is still accepted as a fallback image environment variable,
+but new usage should prefer `CURATOR_IMAGE` or `--image`.
+
+### Using an Existing Container
+
+Use `--container` to run benchmarks or a shell inside a container that is already running:
+
+```bash
+./benchmarking/tools/run.sh --container curator-dev --config benchmarking/my-benchmark.yaml
+```
+
+This mode is useful when a user has already prepared a container with specific packages, mounts, GPUs,
+shared-memory size, network settings, or environment variables. Because Docker cannot add mounts or GPU
+settings to an already-running container, the container must already have the required datasets, model
+weights, results path, GPU access, and other launch-time options in place.
+
+In `--container` mode, config files are copied into the container under `/tmp/curator-benchmarking/configs`,
+and the benchmark runner is called with those copied paths. Large data and result paths are not copied;
+`--setup=check` validates that the paths resolved by the config are visible from inside the container.
+
+`--container` cannot be combined with `--image`, `--use-host-curator`, or `--use-host-curator-benchmarking`.
+Start the container with those mounts/options instead.
+
+### Setup Modes
+
+Use `--setup` to control benchmark environment preparation before running benchmarks:
+
+```bash
+./benchmarking/tools/run.sh --setup=check --config benchmarking/my-benchmark.yaml
+./benchmarking/tools/run.sh --setup=install --config benchmarking/my-benchmark.yaml
+./benchmarking/tools/run.sh --setup=skip --config benchmarking/my-benchmark.yaml
+```
+
+Modes:
+- `check` validates the target environment without installing packages. This is the default.
+- `install` runs benchmark environment setup, then runs the same checks.
+- `skip` trusts the environment and runs the requested command directly.
+
+The setup script runs inside the target environment, so the same checks work for new containers, existing
+containers, and bare-metal environments. Checks include benchmark runner imports, config readability,
+resolved path visibility, selected benchmark script visibility, selected dataset references, GPU visibility
+when selected entries request GPUs, and a `/dev/shm` size warning.
 
 ### Using Host Curator Sources
 
-To run benchmarks using Curator source code from your local repository instead of the version built into the image:
+To run benchmarks using Curator source code from your local repository instead of the version built into
+the image:
 
 ```bash
 ./benchmarking/tools/run.sh --use-host-curator --config benchmarking/my-benchmark.yaml
 ```
 
-This mounts your local Curator repository (from `$HOST_CURATOR_DIR`) into the container at `/opt/Curator`, allowing you to:
+This mounts your local Curator repository (from `$HOST_CURATOR_DIR`) into a new container at `/opt/Curator`,
+allowing you to:
 - Test local changes without rebuilding the Docker image
 - Quickly iterate on Curator development
 - Debug issues with modified source code
@@ -405,27 +489,33 @@ HOST_CURATOR_DIR=/path/to/my/curator/fork ./benchmarking/tools/run.sh --use-host
 
 ### Interactive Shell
 
-Get an interactive bash shell in the container environment:
+Get an interactive bash shell in a new container created from the default image:
 
 ```bash
 ./benchmarking/tools/run.sh --shell
 ```
 
-This is useful for:
-- Exploring the container environment
-- Running benchmarks manually for debugging
-- Checking installed packages and versions
-- Testing commands before adding them to scripts
+Get an interactive shell in a specific image:
 
-### Running Commands in the Container
+```bash
+./benchmarking/tools/run.sh --image nvcr.io/example/curator:my-tag --shell
+```
 
-Execute a specific command in the container without an interactive shell:
+Get an interactive shell in an already-running container:
+
+```bash
+./benchmarking/tools/run.sh --container curator-dev --shell
+```
+
+### Running Commands in the Target Environment
+
+Execute a specific command without an interactive shell:
 
 ```bash
 ./benchmarking/tools/run.sh --shell "uv pip list"
 ```
 
-This runs the command and exits. Examples:
+Examples:
 
 ```bash
 # Check installed packages
@@ -440,7 +530,7 @@ This runs the command and exits. Examples:
 
 ### Controlling GPU Access
 
-Use the `GPUS` environment variable to control which GPUs are visible to the container:
+Use the `GPUS` environment variable to control which GPUs are visible to a newly started container:
 
 ```bash
 # Use all GPUs (default)
@@ -456,10 +546,12 @@ GPUS="device=2" ./benchmarking/tools/run.sh --config my-benchmark.yaml
 GPUS="none" ./benchmarking/tools/run.sh --config my-benchmark.yaml
 ```
 
-The `GPUS` value is passed directly to Docker's `--gpus` flag.
+The `GPUS` value is passed directly to Docker's `--gpus` flag for new containers. It has no effect with
+`--container`, because GPU visibility is fixed when that container is started.
 
 ### More details
-For more details, refer to the `--help` output for `run.sh`
+For more details, refer to the `--help` output for `run.sh`:
+
 ```bash
 ./benchmarking/tools/run.sh --help
 ```
